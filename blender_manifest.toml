@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "osc_recorder"
+version = "0.1.0"
+name = "OSC Minimal Recorder"
+tagline = "Receive OSC data and record it to animation keyframes"
+type = "add-on"
+
+blender_version_min = "3.6.0"
+
+maintainers = ["Carlos Carbonell"]
+license = ["SPDX:CC0-1.0"]
+permissions = ["network"]
+categories = ["System"]
+modules = ["main"]
