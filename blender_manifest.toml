@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "osc_recorder"
 version = "0.1.0"
-name = "OSC Minimal Recorder"
+name = "OSC Recorder"
 tagline = "Receive OSC data and record it to animation keyframes"
 type = "add-on"
 
