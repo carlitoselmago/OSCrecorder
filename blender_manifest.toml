@@ -8,8 +8,9 @@ type = "add-on"
 
 blender_version_min = "4.0.0"
 
-maintainers = ["Carlos Carbonell"]
+maintainer  = "Carlos Carbonell"
 license = ["SPDX:CC0-1.0"]
 permissions = ["network"]
 categories = ["System"]
 modules = ["main"]
+blender_version_min = "4.0.0"
