@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "OSC Minimal Recorder",
-    "author": "Carlos + ChatGPT",
-    "version": (0, 1, 0),
+    "name": "OSC Recorder",
+    "author": "Carlos Carbonell htmlfiesta.com",
+    "version": (0, 4, 0),
     "blender": (3, 6, 0),
     "location": "Sidebar > OSC",
-    "description": "Receive OSC (UDP) into an internal reader object; live + record to keyframes; driver-friendly.",
+    "description": "Receive OSC (UDP), record to keyframes, expose as Geometry Nodes group, driver-friendly.",
     "category": "System",
 }
 
@@ -50,7 +50,6 @@ def normalize_address(address: str | None) -> str:
 # ==========================================
 
 def _read_cstring_padded(data, offset):
-    """Read a null-terminated string padded to 4 bytes."""
     end = data.find(b'\x00', offset)
     if end == -1:
         raise ValueError("OSC: unterminated string")
@@ -61,19 +60,15 @@ def _read_cstring_padded(data, offset):
     return s, new_offset
 
 def parse_osc_message(packet: bytes):
-    """Parse a single OSC message (no bundles)."""
     if packet.startswith(b"#bundle"):
         return None
-
     offset = 0
     address, offset = _read_cstring_padded(packet, offset)
     if not address.startswith("/"):
         return None
-
     type_tag, offset = _read_cstring_padded(packet, offset)
     if not type_tag.startswith(","):
         return address, "", []
-
     tags = type_tag[1:]
     args = []
     for t in tags:
@@ -99,7 +94,7 @@ def parse_osc_message(packet: bytes):
     return address, "," + tags, args
 
 # ==========================================
-# OSC Receiver (UDP, non-blocking)
+# OSC Receiver
 # ==========================================
 
 class _OSCReceiver:
@@ -118,6 +113,7 @@ class _OSCReceiver:
         reader = get_reader()
         if not reader:
             return
+        s = bpy.context.scene.osc_minrec
         while True:
             try:
                 data, addr = self.sock.recvfrom(65535)
@@ -125,7 +121,6 @@ class _OSCReceiver:
                 break
             except Exception:
                 break
-
             parsed = parse_osc_message(data)
             if not parsed:
                 continue
@@ -133,12 +128,27 @@ class _OSCReceiver:
             v = args[0] if len(args) > 0 else None
 
             prop_name = normalize_address(address)
+
+            # If not existing yet
+            if prop_name not in reader.keys():
+                if not s.auto_add_addresses:
+                    continue
+                item = s.addresses.add()
+                item.name = prop_name
+                item.enabled = True
+                reader[prop_name] = 0.0
+
+            # Find metadata
+            addr_meta = next((a for a in s.addresses if a.name == prop_name), None)
+            if addr_meta and not addr_meta.enabled:
+                continue  # skip if disabled
+
+            # Assign value
             if isinstance(v, (bool, int, float, str)) or v is None:
                 reader[prop_name] = v if v is not None else 0.0
             else:
                 reader[prop_name] = str(v)
-
-            reader.location = reader.location  # nudge depsgraph
+            reader.location = reader.location
 
 # ==============================
 # Record handler
@@ -160,6 +170,11 @@ def keyframe_osc_inputs(scene):
 # Scene Properties
 # ==============================
 
+class OSCAddressItem(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty()
+    enabled: bpy.props.BoolProperty(default=True)
+
+
 class OSCAddOnSettings(bpy.types.PropertyGroup):
     bind_ip: bpy.props.StringProperty(
         name="Bind IP", default="0.0.0.0",
@@ -169,11 +184,17 @@ class OSCAddOnSettings(bpy.types.PropertyGroup):
         name="Port", default=9000, min=1, max=65535,
         description="UDP port to listen for OSC",
     )
+    auto_add_addresses: bpy.props.BoolProperty(
+        name="Auto add OSC addresses",
+        default=True,
+        description="Automatically create new OSC properties when first received",
+    )
+    addresses: bpy.props.CollectionProperty(type=OSCAddressItem)
     live_running: bpy.props.BoolProperty(default=False)
     record_running: bpy.props.BoolProperty(default=False)
 
 # ==============================
-# Operators: Live + Record
+# Operators
 # ==============================
 
 class OSC_OT_LiveStart(bpy.types.Operator):
@@ -265,6 +286,106 @@ class OSC_OT_Record(bpy.types.Operator):
         s.record_running = False
         self.report({'INFO'}, "Stopped recording.")
 
+class OSC_OT_AddAddress(bpy.types.Operator):
+    bl_idname = "osc.add_address"
+    bl_label = "Add OSC Address"
+
+    address: bpy.props.StringProperty(name="OSC Address", default="/new/address")
+
+    def execute(self, context):
+        reader = create_reader()
+        s = context.scene.osc_minrec
+        prop_name = normalize_address(self.address)
+
+        if prop_name not in reader.keys():
+            reader[prop_name] = 0.0
+            item = s.addresses.add()
+            item.name = prop_name
+            item.enabled = True
+            self.report({'INFO'}, f"Added {prop_name}")
+        else:
+            self.report({'WARNING'}, f"{prop_name} already exists.")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+class OSC_OT_RemoveAddress(bpy.types.Operator):
+    bl_idname = "osc.remove_address"
+    bl_label = "Remove OSC Address"
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        s = context.scene.osc_minrec
+        reader = get_reader()
+        if 0 <= self.index < len(s.addresses):
+            prop_name = s.addresses[self.index].name
+            if reader and prop_name in reader.keys():
+                del reader[prop_name]
+            s.addresses.remove(self.index)
+            self.report({'INFO'}, f"Removed {prop_name}")
+        return {'FINISHED'}
+
+class OSC_OT_CreateNodegroup(bpy.types.Operator):
+    bl_idname = "osc.create_nodegroup"
+    bl_label = "Create/Update Nodegroup"
+
+    def execute(self, context):
+        s = context.scene.osc_minrec
+        reader = create_reader()
+
+        group_name = "OSC_Inputs"
+        if group_name in bpy.data.node_groups:
+            ng = bpy.data.node_groups[group_name]
+        else:
+            ng = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
+
+        # Ensure Group Output node exists
+        if not any(n for n in ng.nodes if n.type == "GROUP_OUTPUT"):
+            out_node = ng.nodes.new("NodeGroupOutput")
+            out_node.location = (400, 0)
+        else:
+            out_node = next(n for n in ng.nodes if n.type == "GROUP_OUTPUT")
+
+        # Build a map of existing sockets
+        existing = {sock.name: sock for sock in ng.interface.items_tree if sock.item_type == 'SOCKET'}
+
+        # Add new outputs if missing
+        for addr in s.addresses:
+            if addr.name not in existing:
+                sock = ng.interface.new_socket(
+                    name=addr.name,
+                    in_out='OUTPUT',
+                    socket_type='NodeSocketFloat'
+                )
+                # Create Value node + driver
+                val_node = ng.nodes.new("ShaderNodeValue")
+                val_node.label = addr.name
+                val_node.location = (-200, -80 * len(ng.interface.items_tree))
+
+                fcurve = val_node.outputs[0].driver_add("default_value")
+                drv = fcurve.driver
+                drv.type = 'SCRIPTED'
+                var = drv.variables.new()
+                var.name = "var"
+                var.targets[0].id = reader
+                var.targets[0].data_path = f'["{addr.name}"]'
+                drv.expression = "var"
+
+                ng.links.new(val_node.outputs[0], out_node.inputs[sock.identifier])
+
+        # Remove outputs that no longer exist in addresses
+        to_remove = [sock for sock in existing.keys() if sock not in [a.name for a in s.addresses]]
+        for name in to_remove:
+            sock = existing[name]
+            ng.interface.remove(sock)
+
+        self.report({'INFO'}, "Nodegroup created/updated with OSC addresses.")
+        return {'FINISHED'}
+
+
+
 # ==============================
 # UI Panel
 # ==============================
@@ -279,17 +400,21 @@ class OSC_PT_Main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.osc_minrec
+        reader = get_reader()
 
         col = layout.column(align=True)
         col.prop(s, "bind_ip")
         col.prop(s, "port")
+        col.prop(s, "auto_add_addresses")
 
+        # Start/Stop
         row = layout.row(align=True)
         if not s.live_running:
             row.operator("osc.live_start", text="Start", icon="PLAY")
         else:
             row.operator("osc.live_start", text="Stop", icon="PAUSE")
 
+        # Record
         row = layout.row(align=True)
         row.enabled = s.live_running
         if not s.record_running:
@@ -298,30 +423,37 @@ class OSC_PT_Main(bpy.types.Panel):
             row.operator("osc.record", text="Stop Rec", icon="REC")
 
         layout.separator()
-        reader = get_reader()
-        if reader:
-            box = layout.box()
-            box.label(text="Live values (copyable fields):")
-            shown = 0
-            for k, v in reader.items():
-                if not k.startswith("osc_"):
-                    continue
-                # Show as a real Blender property → right-click > Copy Data Path works
-                box.prop(reader, f'["{k}"]', text=k)
-                shown += 1
-                if shown >= 12:
-                    break
-            if shown == 0:
-                box.label(text="(waiting for OSC…)")
+        layout.operator("osc.add_address", icon="ADD")
+        layout.operator("osc.create_nodegroup", icon="NODETREE")
+
+        # Address rows
+        box = layout.box()
+        if len(s.addresses) == 0:
+            box.label(text="No addresses yet…")
+        else:
+            for i, addr in enumerate(s.addresses):
+                row = box.row(align=True)
+                row.prop(addr, "enabled", text="")
+                row.label(text=addr.name)
+
+                if reader and addr.name in reader.keys():
+                    row.prop(reader, f'["{addr.name}"]', text="")
+
+                op = row.operator("osc.remove_address", text="", icon="X")
+                op.index = i
 
 # ==============================
 # Registration
 # ==============================
 
 classes = (
+    OSCAddressItem,
     OSCAddOnSettings,
     OSC_OT_LiveStart,
     OSC_OT_Record,
+    OSC_OT_AddAddress,
+    OSC_OT_RemoveAddress,
+    OSC_OT_CreateNodegroup,
     OSC_PT_Main,
 )
 
