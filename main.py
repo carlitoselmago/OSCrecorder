@@ -1,7 +1,7 @@
 bl_info = {
     "name": "OSC Recorder",
     "author": "Carlos Carbonell htmlfiesta.com",
-    "version": (0, 4, 0),
+    "version": (0, 4, 1),
     "blender": (3, 6, 0),
     "location": "Sidebar > OSC",
     "description": "Receive OSC (UDP), record to keyframes, expose as Geometry Nodes group, driver-friendly.",
@@ -46,8 +46,28 @@ def normalize_address(address: str | None) -> str:
     return text
 
 # ==========================================
-# Minimal OSC parser (message, not bundles)
+# Minimal OSC parser (message + bundles)
 # ==========================================
+
+def parse_osc_packet(packet: bytes):
+    """Return a list of parsed messages: [(address, tags, args), ...]."""
+    if packet.startswith(b"#bundle"):
+        offset = 16  # 8 bytes "#bundle\0" + 8 bytes timetag
+        out = []
+        while offset + 4 <= len(packet):
+            (size,) = struct.unpack(">i", packet[offset:offset+4])
+            offset += 4
+            if size <= 0 or offset + size > len(packet):
+                break
+            msg = packet[offset:offset+size]
+            offset += size
+            parsed = parse_osc_message(msg)
+            if parsed:
+                out.append(parsed)
+        return out
+    else:
+        single = parse_osc_message(packet)
+        return [single] if single else []
 
 def _read_cstring_padded(data, offset):
     end = data.find(b'\x00', offset)
@@ -119,36 +139,41 @@ class _OSCReceiver:
                 data, addr = self.sock.recvfrom(65535)
             except BlockingIOError:
                 break
-            except Exception:
+            except Exception as e:
+                print("Socket error:", e)
                 break
-            parsed = parse_osc_message(data)
-            if not parsed:
+
+            messages = parse_osc_packet(data)
+            if not messages:
                 continue
-            address, _tags, args = parsed
-            v = args[0] if len(args) > 0 else None
 
-            prop_name = normalize_address(address)
+            for (address, _tags, args) in messages:
+                v = args[0] if len(args) > 0 else None
+                prop_name = normalize_address(address)
 
-            # If not existing yet
-            if prop_name not in reader.keys():
-                if not s.auto_add_addresses:
-                    continue
-                item = s.addresses.add()
-                item.name = prop_name
-                item.enabled = True
-                reader[prop_name] = 0.0
+                # If not existing yet
+                if prop_name not in reader.keys():
+                    if not s.auto_add_addresses:
+                        continue
+                    item = s.addresses.add()
+                    item.name = prop_name          # normalized
+                    item.osc_address = address     # original OSC address
+                    item.enabled = True
+                    reader[prop_name] = 0.0
 
-            # Find metadata
-            addr_meta = next((a for a in s.addresses if a.name == prop_name), None)
-            if addr_meta and not addr_meta.enabled:
-                continue  # skip if disabled
+                # Find metadata
+                addr_meta = next((a for a in s.addresses if a.name == prop_name), None)
+                if addr_meta and not addr_meta.enabled:
+                    continue  # skip if disabled
 
-            # Assign value
-            if isinstance(v, (bool, int, float, str)) or v is None:
-                reader[prop_name] = v if v is not None else 0.0
-            else:
-                reader[prop_name] = str(v)
-            reader.location = reader.location
+                # Assign value
+                if isinstance(v, (bool, int, float, str)) or v is None:
+                    reader[prop_name] = v if v is not None else 0.0
+                else:
+                    reader[prop_name] = str(v)
+
+                # Nudge depsgraph
+                reader.location = reader.location
 
 # ==============================
 # Record handler
@@ -171,9 +196,9 @@ def keyframe_osc_inputs(scene):
 # ==============================
 
 class OSCAddressItem(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty()
+    name: bpy.props.StringProperty()         # normalized property name
+    osc_address: bpy.props.StringProperty()  # original OSC address
     enabled: bpy.props.BoolProperty(default=True)
-
 
 class OSCAddOnSettings(bpy.types.PropertyGroup):
     bind_ip: bpy.props.StringProperty(
@@ -301,10 +326,11 @@ class OSC_OT_AddAddress(bpy.types.Operator):
             reader[prop_name] = 0.0
             item = s.addresses.add()
             item.name = prop_name
+            item.osc_address = self.address   # keep original address
             item.enabled = True
-            self.report({'INFO'}, f"Added {prop_name}")
+            self.report({'INFO'}, f"Added {self.address}")
         else:
-            self.report({'WARNING'}, f"{prop_name} already exists.")
+            self.report({'WARNING'}, f"{self.address} already exists.")
         return {'FINISHED'}
 
     def invoke(self, context, event):
@@ -341,17 +367,14 @@ class OSC_OT_CreateNodegroup(bpy.types.Operator):
         else:
             ng = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
 
-        # Ensure Group Output node exists
         if not any(n for n in ng.nodes if n.type == "GROUP_OUTPUT"):
             out_node = ng.nodes.new("NodeGroupOutput")
             out_node.location = (400, 0)
         else:
             out_node = next(n for n in ng.nodes if n.type == "GROUP_OUTPUT")
 
-        # Build a map of existing sockets
         existing = {sock.name: sock for sock in ng.interface.items_tree if sock.item_type == 'SOCKET'}
 
-        # Add new outputs if missing
         for addr in s.addresses:
             if addr.name not in existing:
                 sock = ng.interface.new_socket(
@@ -359,9 +382,8 @@ class OSC_OT_CreateNodegroup(bpy.types.Operator):
                     in_out='OUTPUT',
                     socket_type='NodeSocketFloat'
                 )
-                # Create Value node + driver
                 val_node = ng.nodes.new("ShaderNodeValue")
-                val_node.label = addr.name
+                val_node.label = addr.osc_address or addr.name
                 val_node.location = (-200, -80 * len(ng.interface.items_tree))
 
                 fcurve = val_node.outputs[0].driver_add("default_value")
@@ -375,7 +397,6 @@ class OSC_OT_CreateNodegroup(bpy.types.Operator):
 
                 ng.links.new(val_node.outputs[0], out_node.inputs[sock.identifier])
 
-        # Remove outputs that no longer exist in addresses
         to_remove = [sock for sock in existing.keys() if sock not in [a.name for a in s.addresses]]
         for name in to_remove:
             sock = existing[name]
@@ -383,8 +404,6 @@ class OSC_OT_CreateNodegroup(bpy.types.Operator):
 
         self.report({'INFO'}, "Nodegroup created/updated with OSC addresses.")
         return {'FINISHED'}
-
-
 
 # ==============================
 # UI Panel
@@ -407,14 +426,12 @@ class OSC_PT_Main(bpy.types.Panel):
         col.prop(s, "port")
         col.prop(s, "auto_add_addresses")
 
-        # Start/Stop
         row = layout.row(align=True)
         if not s.live_running:
             row.operator("osc.live_start", text="Start", icon="PLAY")
         else:
             row.operator("osc.live_start", text="Stop", icon="PAUSE")
 
-        # Record
         row = layout.row(align=True)
         row.enabled = s.live_running
         if not s.record_running:
@@ -426,7 +443,6 @@ class OSC_PT_Main(bpy.types.Panel):
         layout.operator("osc.add_address", icon="ADD")
         layout.operator("osc.create_nodegroup", icon="NODETREE")
 
-        # Address rows
         box = layout.box()
         if len(s.addresses) == 0:
             box.label(text="No addresses yet…")
@@ -434,7 +450,7 @@ class OSC_PT_Main(bpy.types.Panel):
             for i, addr in enumerate(s.addresses):
                 row = box.row(align=True)
                 row.prop(addr, "enabled", text="")
-                row.label(text=addr.name)
+                row.label(text=addr.osc_address if addr.osc_address else addr.name)
 
                 if reader and addr.name in reader.keys():
                     row.prop(reader, f'["{addr.name}"]', text="")
@@ -468,9 +484,10 @@ def unregister():
             bpy.app.handlers.frame_change_pre.remove(keyframe_osc_inputs)
     except Exception:
         pass
-    del bpy.types.Scene.osc_minrec
+    if hasattr(bpy.types.Scene, "osc_minrec"):
+        del bpy.types.Scene.osc_minrec
     for c in reversed(classes):
-        bpy.utils.unregister_class(c)
-
-if __name__ == "__main__":
-    register()
+        try:
+            bpy.utils.unregister_class(c)
+        except Exception:
+            pass
